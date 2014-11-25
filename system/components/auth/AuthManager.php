@@ -1,0 +1,723 @@
+<?php
+
+/**
+ * @property boolean $isAuthenticated
+ */
+class AuthManager extends CApplicationComponent
+{
+    const COOKIE_DOMAIN_TYPE_CROSS = 'cross';
+    const COOKIE_DOMAIN_TYPE_TRADER = 'trader';
+    const COOKIE_DOMAIN_TYPE_PARTNER = 'partner';
+
+    const ERROR_LOGIN_ATTEMPTS_FAIL_NUMBER = 100;
+
+    const LOGIN_ATTEMPTS_FAIL_LIMIT = 3;
+    const LOGIN_ATTEMPTS_FAIL_COUNTER_LIFETIME = 600; // 10 min
+
+    const CSRF_TOKEN_LIFETIME = 86400; // 24 hour
+
+    private static $_instance = null;
+
+    protected $csrfTokenCookieKey = 'cf';
+    protected $csrfToken;
+    protected $csrfTokenSign;
+
+    protected $siteSessionId;
+    protected $siteSessionKeyPrefix = 'Session.Site.';
+    protected $siteStateKeyPrefix = 'State.Site.';
+    protected $officeSessionId;
+    protected $officeSessionKeyPrefix = 'Session.';
+    protected $officeStateKeyPrefixPartmer = 'State.Partner.';
+    protected $officeStateKeyPrefixTrader = 'State.Trader.';
+
+    protected $sessionToken;
+
+    protected $keepCurrentSessionId = false;
+
+    protected $redirectUrl;
+
+    protected $username;
+    protected $password;
+
+    protected $enableGodMode = false;
+
+    protected $error;
+
+    protected $currentIdentity;
+
+
+    private function __construct() {}
+    private function __clone() {}
+
+    /**
+     * @return AuthManager
+     */
+    public static function getInstance()
+    {
+        if (null === self::$_instance) {
+            // import components
+            Yii::import('sys.components.auth.AUserIdentity');
+            Yii::import('sys.components.auth.CTraderIdentity');
+            Yii::import('sys.components.auth.CPartnerIdentity');
+            self::$_instance = new self();
+        }
+        return self::$_instance;
+    }
+
+    /**
+     * @return CHttpRequest
+     */
+    public function getRequest()
+    {
+        return Yii::app()->getRequest();
+    }
+
+    /**
+     * Returns cookie collection
+     * @return CCookieCollection
+     */
+    public function getCookies()
+    {
+        return $this->getRequest()->getCookies();
+    }
+
+    /**
+     * @return Redis
+     */
+    public function getRedis()
+    {
+        return Yii::app()->redis->getClient();
+    }
+
+    /**
+     * @return CHttpSession
+     */
+    public function getSessionComponent()
+    {
+        return Yii::app()->session;
+    }
+
+    /**
+     * @return WebUser
+     */
+    public function getWebUser()
+    {
+        return Yii::app()->user;
+    }
+
+    /**
+     * Returns true if WebUser was successfully authenticated
+     * @return boolean
+     */
+    public function getIsAuthenticated()
+    {
+        return !$this->getWebUser()->isGuest;
+    }
+
+    /**
+     * @return CTraderIdentity|CPartnerIdentity|null
+     */
+    public function getCurrentIdentity()
+    {
+        return $this->currentIdentity;
+    }
+
+    /**
+     * Returns the redirect URL
+     * @return string|null
+     */
+    public function getRedirectUrl()
+    {
+        return $this->redirectUrl;
+    }
+
+    /**
+     * @return AuthManager
+     */
+    public function reset()
+    {
+        $this->redirectUrl = null;
+        $this->sessionToken = null;
+        $this->siteSessionId = null;
+        $this->officeSessionId = null;
+
+        $this->csrfToken = null;
+        $this->csrfTokenSign = null;
+
+        $this->error = null;
+
+        $this->currentIdentity = null;
+
+        return $this;
+    }
+
+
+    /**
+     * Defines site session ID
+     * @param string $sid
+     * @return AuthManager
+     */
+    public function setSiteSessionId($sid)
+    {
+        $this->siteSessionId = !empty($sid) ? (string) $sid : null;
+        return $this;
+    }
+
+    /**
+     * Returns generated site-session ID
+     * @return string
+     */
+    public function getSiteSessionId()
+    {
+        if (null === $this->siteSessionId) {
+            if ($this->keepCurrentSessionId) {
+                $sid = $sid = $this->getCookies()->itemAt('WID');
+                empty($sid) && $sid = $this->getSessionComponent()->getSessionID();
+                $this->siteSessionId = $sid;
+            } else {
+                $this->siteSessionId = $this->generateUniqid();
+            }
+        }
+        return $this->siteSessionId;
+    }
+
+    /**
+     * Defines office session ID
+     * @param string $sid
+     * @return AuthManager
+     */
+    public function setOfficeSessionId($sid)
+    {
+        $this->officeSessionId = !empty($sid) ? (string) $sid : null;
+        return $this;
+    }
+
+    /**
+     * Returns generated office-session ID
+     * @return string
+     */
+    public function getOfficeSessionId()
+    {
+        if (null === $this->officeSessionId) {
+            $sid = $this->keepCurrentSessionId
+                ? $this->getSessionComponent()->getSessionID()
+                : $this->generateUniqid();
+            $this->officeSessionId = $sid;
+        }
+        return $this->officeSessionId;
+    }
+
+    /**
+     * Returns generated by officeSessionId token
+     * @return string
+     */
+    public function getSessionToken()
+    {
+        if (null === $this->sessionToken) {
+            if (!$this->getIsAuthenticated()) {
+                throw new RuntimeException('Aborted. You can\'t retrieve session token for unauthenticated user.');
+            }
+            $this->sessionToken = sha1(mt_rand() . $this->getOfficeSessionId() . mt_rand());
+        }
+        return $this->sessionToken;
+    }
+
+    /**
+     * @return string
+     */
+    public function getSiteSessionKeyPrefix()
+    {
+        return $this->siteSessionKeyPrefix;
+    }
+
+    /**
+     * @return string
+     */
+    public function getSiteStateKeyPrefix()
+    {
+        return $this->siteStateKeyPrefix;
+    }
+
+    /**
+     * @param boolean $value
+     * @return AuthManager
+     */
+    public function setKeepCurrentSessionId($value)
+    {
+        $this->keepCurrentSessionId = (boolean) $value;
+        return $this;
+    }
+
+    /**
+     * Returns an error code
+     * @return integer
+     */
+    public function getError()
+    {
+        return $this->error;
+    }
+
+    /**
+     * @return boolean
+     */
+    public function hasError()
+    {
+        return null != $this->error;
+    }
+
+    /**
+     * Returns mode status
+     * @return boolean
+     */
+    public function isGodModeEnabled()
+    {
+        return (boolean) $this->getWebUser()->getState('godmode', false);
+    }
+
+    /**
+     * @param boolean $value
+     * @return AuthManager
+     */
+    public function setGodMode($value)
+    {
+        $this->enableGodMode = (boolean) $value;
+        return $this;
+    }
+
+    /**
+     * Sets up user credentials and resets counters
+     * @param string $username
+     * @param string $password
+     * @return AuthManager
+     */
+    public function setUserPwd($username, $password)
+    {
+        $previousUsername = $this->username && $this->username !== $username ? $this->username : null;
+        $this->username = (string) $username;
+        $this->password = (string) $password;
+        $previousUsername && $this->reset();
+        return $this;
+    }
+
+
+    /**
+     * @param string $username
+     * @param string $password
+     * @param boolean $validatePwd [optional, dafault=true]
+     * @return boolean
+     */
+    public function login($username, $password, $validatePwd = true)
+    {
+        $this->setUserPwd($username, $password);
+        if (self::LOGIN_ATTEMPTS_FAIL_LIMIT <= $this->getFailedLoginAttemptsOfUser($this->username)) {
+            $this->error = self::ERROR_LOGIN_ATTEMPTS_FAIL_NUMBER;
+            return false;
+        }
+        $traderIdentity = $this->loginTraderIdentity($this->username, $this->password, $validatePwd);
+        $partnerIdentity = $this->loginPartnerIdentity($this->username, $this->password, $validatePwd);
+
+        if ($traderIdentity->errorCode && $partnerIdentity->errorCode) {
+            // login failed
+            $this->error = CUserIdentity::ERROR_UNKNOWN_IDENTITY != $partnerIdentity->errorCode
+                ? $partnerIdentity->errorCode
+                : $traderIdentity->errorCode;
+            $this->incrementFailedLoginAttemptsOfUser($this->username);
+            return false;
+        } else if (Utils::isTraderCabinet() && $traderIdentity->isAuthenticated) {
+            $this->redirectUrl = Yii::app()->params['accountSiteSSL'];
+        } else if (Utils::isPartnerCabinet() && $partnerIdentity->isAuthenticated) {
+            $this->redirectUrl = Yii::app()->params['partnerSiteSSL'];
+        } else {
+            // has both accounts (trader and partner)
+            $traderActivityTime = $traderIdentity->isAuthenticated ? $traderIdentity->getLastActivityTime() : null;
+            $partnerActivityTime = $partnerIdentity->isAuthenticated ? $partnerIdentity->getLastActivityTime() : null;
+            $k =  $traderActivityTime > $partnerActivityTime ? 'accountSiteSSL' : 'partnerSiteSSL';
+            $this->redirectUrl = Yii::app()->params[$k];
+        }
+
+        $webUser = $this->getWebUser();
+        // create new session for www-site
+        $this->openSession($this->getSiteSessionId(), $this->siteSessionKeyPrefix);
+        if ($traderIdentity->isAuthenticated && $partnerIdentity->isAuthenticated) {
+            $identity = Utils::isPartnerCabinet() ? $partnerIdentity : $traderIdentity;
+        } else {
+            $identity = $traderIdentity->isAuthenticated ? $traderIdentity : $partnerIdentity;
+        }
+        $webUser->setStateKeyPrefix($this->siteStateKeyPrefix);
+        if ($webUser->login($identity)) {
+            $this->currentIdentity = $identity;
+        }
+        $webUser->setState('username', $identity->getFullName());
+        $webUser->setState('email', $identity->getEmail());
+        $webUser->setState('roomUrl', $this->getRedirectUrl());
+        $webUser->setState('isTrader', $traderIdentity->isAuthenticated ? $traderIdentity->getId() : null);
+        $webUser->setState('isPartner', $partnerIdentity->isAuthenticated ? $partnerIdentity->getId() : null);
+
+        // set session token and other session params in Redis
+        $sessionToken = $this->getSessionToken();
+        $this->getRedis()->set($sessionToken .'SID', $this->getOfficeSessionId(), 60);
+        $this->getRedis()->set($sessionToken .'WID', $this->getSiteSessionId(), 60);
+        $this->getRedis()->set($sessionToken .'URL', $this->getRedirectUrl(), 60);
+
+        $this->resetFailedloginAttemptsOfUser($this->username);
+        return true;
+    }
+
+    /**
+     * @param string $username
+     * @param string $password
+     * @param boolean $validatePwd [optional, default=true]
+     * @return CTraderIdentity
+     */
+    public function loginTraderIdentity($username, $password, $validatePwd = true)
+    {
+        $traderIdentity = new CTraderIdentity($username, $password);
+        // try to authenticate Trader identity
+        if ($traderIdentity->authenticate($validatePwd, $this->enableGodMode)) {
+            $this->openSession($this->getOfficeSessionId(), $this->officeSessionKeyPrefix);
+            // set all the state params
+            $traderIdentity->setStateParams();
+
+            $this->getWebUser()->setStateKeyPrefix($this->officeStateKeyPrefixTrader);
+            $this->getWebUser()->login($traderIdentity);
+            // create safe accounts if needed
+            $traderIdentity->getModel()->createSafeAccounts(true);
+            // add login info to the log
+            Logging::$project = Logging::PROJECT_TRADER;
+            Logging::log(Logging::LOGIN);
+        }
+        return $traderIdentity;
+    }
+
+    /**
+     * @param string $username
+     * @param string $password
+     * @param boolean $validatePwd [optional, default=true]
+     * @return CPartnerIdentity
+     */
+    public function loginPartnerIdentity($username, $password, $validatePwd = true)
+    {
+        $partnerIdentity = new CPartnerIdentity($username, $password);
+        // try to authenticate Partner identity
+        if ($partnerIdentity->authenticate($validatePwd, $this->enableGodMode)) {
+            $this->openSession($this->getOfficeSessionId(), $this->officeSessionKeyPrefix);
+            // set all the state params
+            $partnerIdentity->setStateParams();
+
+            $this->getWebUser()->setStateKeyPrefix($this->officeStateKeyPrefixPartmer);
+            $this->getWebUser()->login($partnerIdentity);
+            // add login info to the log
+            Logging::$project = Logging::PROJECT_PARTNER;
+            Logging::log(Logging::LOGIN);
+        }
+        return $partnerIdentity;
+    }
+
+    /**
+     * @param string $sessionToken
+     * @param boolean $autoSetCookies [optional, default=true]
+     * @return boolean
+     */
+    public function logon($sessionToken, $autoSetCookies = true)
+    {
+        $redis = $this->getRedis();
+        $this->reset();
+        // get session tokens and other session params from Redis
+        $fsid = $redis->get($sessionToken .'SID');
+        $ssid = $redis->get($sessionToken .'WID');
+        if ($ssid && $fsid) {
+            $this->siteSessionId = $ssid;
+            $this->officeSessionId = $fsid;
+            $this->redirectUrl = $redis->get($sessionToken .'URL');
+
+            $redis->delete($sessionToken .'SID');
+            $redis->delete($sessionToken .'WID');
+            $redis->delete($sessionToken .'URL');
+
+            // set session cookies
+            $autoSetCookies && $this->setSessionCookies();
+            return true;
+        } else {
+            throw new RuntimeException('Failed to retrieve sessionID by token.');
+        }
+        return false;
+    }
+
+    /**
+     * LogOut and destroy all the session data
+     * @param integer $autoLogoutEvent
+     * @return boolean
+     */
+    public function logout($autoLogoutEvent = null)
+    {
+        $lang = $this->getWebUser()->getState('lang');
+        $cookies = $this->getCookies();
+        if ($cookies->contains('WID')) {
+            $this->openSession($cookies['WID'], $this->siteSessionKeyPrefix)->destroy();
+        }
+        if ($cookies->contains('SID')) {
+            $this->openSession($cookies['SID'], $this->officeSessionKeyPrefix)->destroy();
+        }
+        // reset all cookies
+        $this->resetSessionCookies();
+        // set language cookie
+        $xDomain = $this->getCookieDomain(self::COOKIE_DOMAIN_TYPE_CROSS);
+        $cookies->add('lang', new CHttpCookie('lang', $lang, array('domain' => $xDomain)));
+
+        Logging::log(null === $autoLogoutEvent ? Logging::LOGOUT : (int) $autoLogoutEvent);
+        return true;
+    }
+
+
+    /**
+     * Creates a new session with specified ID
+     * @param string $sid
+     * @param string $keyPrefix
+     * @param string $cookieMode
+     * @return CHttpSession
+     */
+    public function openSession($sid, $keyPrefix = null, $cookieMode = 'none')
+    {
+        $session = $this->getSessionComponent();
+        $session->close();
+        $session->setSessionID((string) $sid);
+        null !== $keyPrefix && $session->keyPrefix = (string) $keyPrefix;
+        $session->keyPrefix = $keyPrefix;
+        $session->setCookieMode((string) $cookieMode);
+        $session->open();
+
+        $session->add('time', time());
+        $session->add('ip', Utils::getRealIp());
+        return $session;
+    }
+
+    /**
+     * Returns the value of user's failed login attempts
+     * @param string $username
+     * @return integer
+     */
+    public function getFailedLoginAttemptsOfUser($username)
+    {
+        $key = $this->getFailedLoginAttemptsOfUserKey($username);
+        return (int) $this->getRedis()->get($key);
+    }
+
+    /**
+     * Increments the value of user's failed login attempts counter
+     * @param string $username
+     * @return integer
+     */
+    public function incrementFailedLoginAttemptsOfUser($username)
+    {
+        $value = $this->getFailedLoginAttemptsOfUser($username) + 1;
+        $key = $this->getFailedLoginAttemptsOfUserKey($username);
+        $this->getRedis()->set($key, $value, self::LOGIN_ATTEMPTS_FAIL_COUNTER_LIFETIME);
+        return $value;
+    }
+
+    /**
+     * Resets the value of user's failed login attempts counter
+     * @param string $username
+     * @return AuthManager
+     */
+    public function resetFailedloginAttemptsOfUser($username)
+    {
+        $key = $this->getFailedLoginAttemptsOfUserKey($username);
+        $this->getRedis()->delete($key);
+        return $this;
+    }
+
+    /**
+     * Generates string key to get/set value of failed login attempts counter
+     * @param string $username
+     * @return string
+     */
+    protected function getFailedLoginAttemptsOfUserKey($username)
+    {
+        return 'ATTEMPTS'. md5((string) $username);
+    }
+
+    /**
+     * Binds username to captcha validation to be able to reset counter
+     * @param string $usernam
+     * @return AuthManager
+     */
+    public function setFailedLoginUsername($username)
+    {
+        $key = 'CAPTCHA_EMAIL'. $this->getCSRFToken();
+        $this->getRedis()->set($key, (string) $username, self::LOGIN_ATTEMPTS_FAIL_COUNTER_LIFETIME);
+        return $this;
+    }
+
+    /**
+     * Returns stored username
+     * @return string|null
+     */
+    public function getFailedLoginUsername()
+    {
+        $key = 'CAPTCHA_EMAIL'. $this->getCSRFToken();
+        return $this->getRedis()->get($key);
+    }
+
+    /**
+     * @param string $type [optional, default=cross] cross|partner|trader
+     * @return string
+     */
+    public function getCookieDomain($type = self::COOKIE_DOMAIN_TYPE_CROSS)
+    {
+        if (self::COOKIE_DOMAIN_TYPE_PARTNER == $type) {
+            return parse_url(Yii::app()->params['partnerSite'], PHP_URL_HOST);
+        } else if (self::COOKIE_DOMAIN_TYPE_TRADER == $type) {
+            return parse_url(Yii::app()->params['accountSite'], PHP_URL_HOST);
+        } else {
+            return str_replace('www', '', parse_url(Yii::app()->params['site'], PHP_URL_HOST));
+        }
+    }
+
+
+
+    /**
+     * @param boolean $regenerate [optional, default=false]
+     * @return string|false
+     */
+    public function getCSRFToken($regenerate = false)
+    {
+        $redis = $this->getRedis();
+        $cookies = $this->getCookies();
+
+        // reset csrf token data
+        if ($regenerate) {
+            $this->csrfToken = null;
+            $this->csrfTokenSign = null;
+            $cookies->remove($this->csrfTokenCookieKey);
+        } else if ((null == $this->csrfToken || null == $this->csrfTokenSign)
+            && !empty($cookies[$this->csrfTokenCookieKey])
+        ) {
+            $key = (string) $cookies[$this->csrfTokenCookieKey];
+            $this->csrfToken = $redis->get('CSRF'. $key);
+            $this->csrfTokenSign = $redis->get('CSRF'. $key .'sign');
+        }
+
+        if ($this->csrfToken && $this->getRequestSign() === $this->csrfTokenSign) {
+            // return current token
+            return $this->csrfToken;
+        }
+        // set and return a new token
+        return $this->setCSRFToken();
+    }
+
+    /**
+     * @param string $token [optional]
+     * @param string $index [optional]
+     * @return string|boolean false on failure
+     */
+    public function setCSRFToken($token = null, $index = null)
+    {
+        $this->csrfToken = null;
+        $this->csrfTokenSign = null;
+
+        null === $token && $token = strtoupper($this->generateUniqid());
+        null === $index && $index = strtoupper($this->generateUniqid());
+
+        $cookies = $this->getCookies();
+        // add token KEY to cookies
+        $cookies->add($this->csrfTokenCookieKey, new CHttpCookie($this->csrfTokenCookieKey, $index, array(
+        	'domain' => $this->getCookieDomain(self::COOKIE_DOMAIN_TYPE_CROSS),
+            'httpOnly' => true,
+        )));
+
+        if ($cookies->contains($this->csrfTokenCookieKey)) {
+            $this->csrfToken = $token;
+            $this->csrfTokenSign = $this->getRequestSign();
+
+            $this->getRedis()->set('CSRF'. $index, $this->csrfToken, self::CSRF_TOKEN_LIFETIME);
+            $this->getRedis()->set('CSRF'. $index .'sign', $this->csrfTokenSign, self::CSRF_TOKEN_LIFETIME);
+            return $token;
+        }
+        return false;
+    }
+
+    /**
+     * Generates uniqie hash
+     * @param boolean $withRequestSign [optional, default=true]
+     * @return string
+     */
+    public function generateUniqid($withRequestSign = true)
+    {
+        return md5(microtime() . ($withRequestSign ? $this->getRequestSign() : ''));
+    }
+
+    /**
+     * @return string
+     */
+    public function getRequestSign()
+    {
+        return $this->getRequest()->getUserHostAddress() . $this->getRequest()->getUserAgent();
+    }
+
+
+    /**
+     * @return string
+     */
+    public function getCaptchaCode()
+    {
+        $key = 'CAPTCHA' . $this->getCSRFToken();
+        return $this->getRedis()->get($key);
+    }
+
+    /**
+     * @param string $code
+     * @return AuthManager
+     */
+    public function setCaptchaCode($code)
+    {
+        $key = 'CAPTCHA' . $this->getCSRFToken();
+        $this->getRedis()->set($key, (string) $code, self::LOGIN_ATTEMPTS_FAIL_COUNTER_LIFETIME);
+        return $this;
+    }
+
+    /**
+     * @param string` $code
+     * @return boolean
+     */
+    public function validateCaptchaCode($code)
+    {
+        return 0 === strcasecmp((string) $code, $this->getCaptchaCode());
+    }
+
+    /**
+     * @return AuthManager
+     */
+    public function resetSessionCookies()
+    {
+        $cn = array('SID', 'WID', '_sid', 'lang', $this->csrfTokenCookieKey);
+        $cookieCollection = $this->getCookies();
+        foreach ($cn as $name) {
+            $cookieCollection->remove($name);
+        }
+
+        return $this;
+    }
+
+    /**
+     * @return CCookieCollection
+     */
+    public function setSessionCookies()
+    {
+        $xDomain = $this->getCookieDomain(self::COOKIE_DOMAIN_TYPE_CROSS);
+        $cookies = $this->getCookies();
+        $cookies->add('SID', new CHttpCookie('SID', $this->getOfficeSessionId(), array(
+            'domain' => $xDomain,
+            'httpOnly' => true,
+            'secure' => true,
+        )));
+        $cookies->add('WID', new CHttpCookie('WID', $this->getSiteSessionId(), array(
+            'domain' => $xDomain,
+            'httpOnly' => true,
+            'secure' => true,
+        )));
+
+        return $cookies;
+    }
+
+}
